@@ -80,14 +80,25 @@ CREATE INDEX idx_articles_series_id ON articles(series_id);
 CREATE INDEX idx_references_article_id ON references(article_id);
 ```
 
-### 4. Edge Function（オプション）のセットアップ
+### 4. Edge Functions デプロイ（重要）
 
-note.com記事インポート機能を使う場合：
+記事生成機能を使う場合、以下のEdge Functionsをデプロイする必要があります：
 
-1. Suabaseダッシュボール → Edge Functions
-2. 「Create a new function」をクリック
-3. 関数名：`note-import`
-4. `supabase-edge-function-note-import.ts` の内容をコピー＆ペースト
+```bash
+bash deploy-edge-functions.sh
+```
+
+または手動で：
+
+```bash
+supabase link --project-ref ujymuexfxhuvrpkprkch
+supabase functions deploy generate-outline --no-verify-jwt
+supabase functions deploy generate-article --no-verify-jwt
+supabase functions deploy article-helpers --no-verify-jwt
+supabase functions deploy note-import --no-verify-jwt
+```
+
+詳細は **EDGE_FUNCTIONS_SETUP.md** と **DEPLOYMENT_CHECKLIST.md** を参照してください。
 
 ## 💻 開発
 
