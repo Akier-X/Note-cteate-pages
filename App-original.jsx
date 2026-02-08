@@ -3,14 +3,15 @@ import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
-const EDGE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1`;
-
 const supabase = SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
 var STEPS = ["入力", "構成", "記事生成"];
 var TONES = ["カジュアル", "丁寧・フォーマル", "熱量高め", "淡々と解説", "ストーリー調"];
 var LENS = ["短（1000〜1500字）", "中（2000〜3000字）", "長（3000〜5000字）"];
 var IMGS = ["写真風", "イラスト風", "フラットデザイン", "水彩画風", "アニメ風", "ミニマル"];
+var TOKEN_MAP = { "短（1000〜1500字）": 5000, "中（2000〜3000字）": 8000, "長（3000〜5000字）": 12000 };
+var CONT_TOKENS = 6000;
+var MAX_CONTINUES = 3;
 
 function doCopy(txt, setFn, label) {
   try {
@@ -26,33 +27,38 @@ function doCopy(txt, setFn, label) {
   } catch (e) { setFn("fail"); setTimeout(function () { setFn(""); }, 2000); }
 }
 
-async function callEdgeFunction(endpoint, payload) {
-  const r = await fetch(`${EDGE_FUNCTION_URL}/${endpoint}`, {
+async function callApi(prompt, sys, maxTokens, messages) {
+  var msgs = messages || [{ role: "user", content: prompt }];
+  var r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    headers: { "Content-Type": "application/json", "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY || "" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens || 4000, system: sys, messages: msgs })
   });
-  if (!r.ok) throw new Error(await r.text());
-  return await r.json();
+  var d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  var text = d.content.map(function (b) { return b.text || ""; }).join("\n");
+  return { text: text, truncated: d.stop_reason === "max_tokens" };
 }
 
 async function fetchNoteArticle(key) {
-  const r = await fetch(`${EDGE_FUNCTION_URL}/note-import`, {
+  if (!supabase) throw new Error("Supabaseが未設定");
+  var r = await fetch("/api/note-import", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ key }),
+    body: JSON.stringify({ key: key }),
+    headers: { "Content-Type": "application/json" }
   });
-  if (!r.ok) throw new Error("記事取得失敗");
+  if (!r.ok) throw new Error("記事取得失敗: " + r.statusText);
   return await r.json();
 }
 
 async function fetchNoteUserArticles(username) {
-  const r = await fetch(`${EDGE_FUNCTION_URL}/note-import`, {
+  if (!supabase) throw new Error("Supabaseが未設定");
+  var r = await fetch("/api/note-import", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username }),
+    body: JSON.stringify({ username: username }),
+    headers: { "Content-Type": "application/json" }
   });
-  if (!r.ok) throw new Error("ユーザー記事一覧取得失敗");
+  if (!r.ok) throw new Error("ユーザー記事一覧取得失敗: " + r.statusText);
   return await r.json();
 }
 
@@ -64,9 +70,59 @@ var stTag = { background: "#f0faf8", color: "#2BA89D", padding: "3px 8px", borde
 function btnPrimary(ok) { return { width: "100%", padding: "12px", borderRadius: 9, border: "none", fontSize: 14, fontWeight: 700, background: ok ? "linear-gradient(135deg,#41C9B4,#2BA89D)" : "#ccc", color: "white", cursor: ok ? "pointer" : "not-allowed" }; }
 function btnCopy(on) { return { padding: "4px 10px", borderRadius: 5, border: "1px solid #ddd", background: on ? "#41C9B4" : "white", color: on ? "white" : "#555", fontSize: 11, cursor: "pointer" }; }
 
-function extractNB(raw) {
-  if (!raw) return [];
-  var ps = [], ls = raw.split("\n");
+function fallbackOL(theme) {
+  return {
+    titles: [theme + "について", theme + "の完全ガイド", theme + "入門"],
+    sections: [
+      { heading: "はじめに", level: "h2", summary: "導入・背景", hasImage: true, imageDesc: "Modern concept of " + theme, subheadings: [] },
+      { heading: "詳細解説", level: "h2", summary: "本論", hasImage: true, imageDesc: "Detailed illustration about " + theme, subheadings: [] },
+      { heading: "まとめ", level: "h2", summary: "まとめと次のアクション", hasImage: false, imageDesc: "", subheadings: [] }
+    ],
+    hashtags: ["ブログ", "ライフハック", "学び", "tips", "日本語", "note", "まとめ", "おすすめ"],
+    seoDescription: theme + "について詳しく解説します。"
+  };
+}
+
+function safeJSON(txt, theme) {
+  var s = txt.replace(/^[\s\S]*?```(?:json)?\s*\n?/, "").replace(/\n?\s*```[\s\S]*$/, "").trim();
+  if (s.indexOf("{") === -1) s = txt;
+  var st = s.indexOf("{");
+  if (st < 0) return fallbackOL(theme);
+  var dp = 0, en = -1;
+  for (var j = st; j < s.length; j++) {
+    if (s[j] === "{") dp++;
+    else if (s[j] === "}") { dp--; if (dp === 0) { en = j; break; } }
+  }
+  if (en < 0) {
+    s = s.slice(st);
+    s = s.replace(/,\s*"[^"]*$/, "").replace(/,\s*$/, "");
+    var ob = (s.match(/{/g) || []).length, cb = (s.match(/}/g) || []).length;
+    var oq = (s.match(/\[/g) || []).length, cq = (s.match(/]/g) || []).length;
+    for (var k = 0; k < oq - cq; k++) s += "]";
+    for (var k2 = 0; k2 < ob - cb; k2++) s += "}";
+    s = s.replace(/,\s*([}\]])/g, "$1");
+    try { return validateOL(JSON.parse(s), theme); } catch (e) { return fallbackOL(theme); }
+  }
+  s = s.slice(st, en + 1).replace(/,\s*([}\]])/g, "$1").replace(/'/g, '"').replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ");
+  try { return validateOL(JSON.parse(s), theme); } catch (e) { return fallbackOL(theme); }
+}
+
+function validateOL(p, theme) {
+  if (!p || typeof p !== "object") return fallbackOL(theme);
+  if (!p.titles || !Array.isArray(p.titles) || p.titles.length === 0) p.titles = [theme + "について", theme + "の完全ガイド", theme + "入門"];
+  p.titles = p.titles.filter(function(t){ return t && t.trim(); });
+  if (p.titles.length < 2) { p.titles.push(theme + "の完全ガイド"); p.titles.push(theme + "入門"); }
+  if (!p.hashtags || !Array.isArray(p.hashtags) || p.hashtags.length === 0) p.hashtags = ["ブログ", "ライフハック", "学び", "tips", "日本語"];
+  p.hashtags = p.hashtags.filter(function(h){ return h && h.trim(); }).map(function(h){ return h.replace(/^#/, ""); });
+  while (p.hashtags.length < 8) p.hashtags.push("note記事");
+  if (!p.sections || !Array.isArray(p.sections) || p.sections.length === 0) p.sections = fallbackOL(theme).sections;
+  if (!p.seoDescription) p.seoDescription = theme + "について詳しく解説します。";
+  return p;
+}
+
+function extractNB(t) {
+  if (!t) return [];
+  var ps = [], ls = t.split("\n");
   for (var i = 0; i < ls.length; i++) {
     if ((ls[i].indexOf("NanoBanana") !== -1 || ls[i].indexOf("📷") !== -1) && (ls[i].indexOf("prompt") !== -1 || ls[i].indexOf("NanoBanana") !== -1)) {
       var b = [ls[i].trim()]; var j = i + 1;
@@ -109,6 +165,7 @@ export default function App() {
   var _showNS = useState(false), showNS = _showNS[0], setShowNS = _showNS[1];
   var _viewArt = useState(null), viewArt = _viewArt[0], setViewArt = _viewArt[1];
   var _forSr = useState(null), forSr = _forSr[0], setForSr = _forSr[1];
+  var _conn = useState(""), conn = _conn[0], setConn = _conn[1];
   var _refs = useState([]), refs = _refs[0], setRefs = _refs[1];
   var _newRef = useState({ title: "", url: "" }), newRef = _newRef[0], setNewRef = _newRef[1];
   var _truncWarn = useState(false), truncWarn = _truncWarn[0], setTruncWarn = _truncWarn[1];
@@ -137,7 +194,7 @@ export default function App() {
   useEffect(function () {
     if (init.current) return;
     init.current = true;
-    if (!supabase) { setErr("Supabaseが未設定です"); return; }
+    if (!supabase) { setErr("Supabaseが未設定です。.env.localを確認してください。"); return; }
     (async function () {
       try {
         var { data: artData } = await supabase.from("articles").select("*").order("created_at", { ascending: false });
@@ -157,33 +214,61 @@ export default function App() {
     return { sr: s, isFirst: arts.filter(function(a){ return a.series_id === forSr; }).length === 0, num: arts.filter(function(a){ return a.series_id === forSr; }).length + 1 };
   }
 
+  function makeNBPrompt(desc, heading) {
+    var styles = { "写真風": "photorealistic, high resolution", "イラスト風": "digital illustration, vibrant", "フラットデザイン": "flat design, modern", "水彩画風": "watercolor, soft colors", "アニメ風": "anime style, cel-shaded", "ミニマル": "minimalist, clean" };
+    var aspects = { "16:9": "landscape 16:9", "1:1": "square 1:1", "9:16": "portrait 9:16" };
+    return desc + ". " + (styles[iStyle] || "photorealistic") + ". " + (aspects[iAsp] || "landscape 16:9") + ". Japanese aesthetic. If person: Japanese. For " + heading + ". No text, no watermark.";
+  }
+
+  function makeEyecatch(title, themeText) {
+    var styles = { "写真風": "photorealistic, cinematic", "イラスト風": "illustration, vibrant", "フラットデザイン": "flat design", "水彩画風": "watercolor", "アニメ風": "anime style", "ミニマル": "minimalist" };
+    return "Eye-catching hero: " + title + ". " + themeText + ". " + (styles[iStyle] || "photorealistic") + ". 16:9, hero for blog. If person: Japanese. No text.";
+  }
+
+  function buildSeriesContext() {
+    if (!forSr) return "";
+    var prevArts = arts.filter(function(a){ return a.series_id === forSr; }).sort(function(a,b){ return new Date(a.created_at) - new Date(b.created_at); });
+    if (!prevArts.length) return "\nこれはシリーズの第1回（導入回）です。読者を惹きつける導入を書き、次回への期待を持たせてください。";
+    var ctx = "\n\n【シリーズ情報 - 重要】\nこれはシリーズの第" + (prevArts.length + 1) + "回です。前回までの流れを踏まえ、自然な続きとして書いてください。\n";
+    prevArts.slice(-3).forEach(function(a, i) {
+      var summary = a.raw ? a.raw.slice(0, 600) : "";
+      ctx += "\n--- 第" + (prevArts.length - 3 + i + 1) + "回: " + a.title + " ---\n";
+      ctx += "冒頭概要: " + summary.split("\n").slice(0, 5).join(" ").slice(0, 200) + "\n";
+    });
+    ctx += "\n【ストーリー継続のルール】\n1. 前回の結論やまとめを受けて、自然に今回のテーマに繋げる\n2. 読者が前回から成長・進展を感じられる構成にする\n";
+    return ctx;
+  }
+
+  function buildSeriesLinks() {
+    if (!forSr) return "";
+    var sr = series.find(function (x) { return x.id === forSr; });
+    if (!sr) return "";
+    var sa = arts.filter(function(a){ return a.series_id === forSr; }).sort(function(a,b){ return new Date(a.created_at) - new Date(b.created_at); });
+    if (!sa.length) return "\n\n---\n\nシリーズ「" + sr.name + "」第1回です。";
+    var links = sa.map(function (a, i) { return "- 第" + (i + 1) + "回: " + a.title; }).join("\n");
+    return "\n\n---\n\nシリーズ「" + sr.name + "」\n" + links + "\n- 第" + (sa.length + 1) + "回: 本記事";
+  }
+
+  function buildRefLinks() {
+    if (!refs.length) return "";
+    return "\n\n---\n\n参考文献\n" + refs.map(function (r, i) { return (i + 1) + ". [" + r.title + "](" + r.url + ")"; }).join("\n");
+  }
+
   async function genOL() {
     setLoading(true); setErr("");
     try {
-      var seriesCtx = "";
-      if (forSr) {
-        var prevArts = arts.filter(function(a){ return a.series_id === forSr; });
-        if (prevArts.length) {
-          seriesCtx = "\n【シリーズ】第" + (prevArts.length + 1) + "回";
-        }
-      }
+      var seriesCtx = buildSeriesContext();
+      var pr = paid ? "\n有料記事として構成。各sectionにisFreeを付与。" : "";
+      var iff = paid ? ',"isFree":true' : "";
+      var prompt = "あなたはnote.comのプロ記事構成作家です。以下の情報から記事構成をJSON形式で出力してください。\n\nテーマ: " + theme + "\nキーワード: " + (kw || "なし") + "\nトーン: " + tone + "\n想定読者: " + (aud || "一般") + "\n文字数: " + len + seriesCtx + pr;
+      if (userInst.trim()) prompt += "\n\n【ユーザーからの追加指示】\n" + userInst;
+      prompt += '\n\n【出力JSON形式（厳守）】\n{"titles":["タイトル1","タイトル2","タイトル3"],"sections":[{"heading":"見出し","level":"h2","summary":"内容概要","hasImage":true,"imageDesc":"ENGLISH description"' + iff + ',"subheadings":[]}],"hashtags":["タグ1","タグ2","タグ3","タグ4","タグ5","タグ6","タグ7","タグ8"],"seoDescription":"SEO説明文"}';
 
-      var result = await callEdgeFunction("generate-outline", {
-        theme, kw, tone, aud, len, paid, userInst, seriesCtx
-      });
-
-      setOL(result.outline);
-      setTitles(result.outline.titles);
-      setSel(result.outline.titles[0]);
-      setTags(result.outline.hashtags);
-
-      var eyecatchRes = await callEdgeFunction("article-helpers", {
-        action: "makeEyecatch",
-        title: result.outline.titles[0],
-        theme: theme,
-        iStyle: iStyle
-      });
-      setEyecatch(eyecatchRes.prompt || "");
+      var result = await callApi(prompt, "note.com記事構成作家。純粋なJSONのみ出力。{で始まり}で終わるJSONのみ。", 4000);
+      var p = safeJSON(result.text, theme);
+      setOL(p); setTitles(p.titles); setSel(p.titles[0]); setTags(p.hashtags);
+      if (paid && p.paidConfig) { if (p.paidConfig.recommendedPrice) setPrice(String(p.paidConfig.recommendedPrice)); }
+      setEyecatch(makeEyecatch(p.titles[0], p.seoDescription || theme));
       setStep(1);
     } catch (e) { setErr("構成生成失敗: " + e.message); }
     setLoading(false);
@@ -192,22 +277,45 @@ export default function App() {
   async function genArt() {
     setLoading(true); setErr(""); setTruncWarn(false); setLoadMsg("⏳ 記事を生成中...");
     try {
-      var seriesCtx = "";
-      if (forSr) {
-        var prevArts = arts.filter(function(a){ return a.series_id === forSr; });
-        if (prevArts.length) {
-          seriesCtx = "\n【シリーズ】第" + (prevArts.length + 1) + "回 前回の続き";
-        }
+      var secStr = outline.sections.map(function (s, i) {
+        var t = (i + 1) + ". [h2] " + s.heading + ": " + s.summary + (s.hasImage ? " [画像あり]" : "");
+        if (s.hasImage && s.imageDesc) t += "\n[NanoBanana]: " + makeNBPrompt(s.imageDesc, s.heading);
+        if (s.subheadings) s.subheadings.forEach(function (sub) { t += "\n  - [h3] " + sub.heading + ": " + sub.summary; });
+        return t;
+      }).join("\n");
+      var seriesCtx = buildSeriesContext();
+      var pi = paid ? "\n有料記事（" + price + "円）。セクション" + (pidx + 1) + "前に「💰 ここから先は有料部分です」挿入" : "";
+      var prompt = "以下の構成でnote.com記事を日本語で執筆。\n\nタイトル: " + sel + "\nテーマ: " + theme + "\nキーワード: " + kw + "\nトーン: " + tone + "\n読者: " + (aud || "一般") + "\n文字数: " + len + "\n\n構成:\n" + secStr + seriesCtx + pi;
+      if (userInst.trim()) prompt += "\n\n【ユーザーからの追加指示】\n" + userInst;
+      prompt += "\n\n【執筆ルール】\n1. h2=「## 」h3=「### 」使用。h1不使用\n2. タイトルを本文に含めない。## から開始\n3. 画像箇所: 📷 NanoBanana prompt:\n「English prompt」\n4. 段落間空行\n5. **太字**、>引用、-箇条書き使用\n6. 必ず「## まとめ」で完結\n7. 指定文字数を満たすこと";
+
+      var sysPrompt = "note.comプロライター。日本語で記事執筆。タイトルは本文に含めない。NanoBananaプロンプトは英語。文字数厳守。必ず最後まで書き切る。";
+      var tokens = TOKEN_MAP[len] || 8000;
+      var result = await callApi(prompt, sysPrompt, tokens);
+      var fullText = result.text;
+      var attempt = 0;
+      while (result.truncated && attempt < MAX_CONTINUES) {
+        attempt++;
+        setLoadMsg("⏳ 続き生成中...（" + attempt + "/" + MAX_CONTINUES + "）");
+        result = await callApi(null, sysPrompt, CONT_TOKENS, [
+          { role: "user", content: prompt },
+          { role: "assistant", content: fullText },
+          { role: "user", content: "中断箇所から続きを。既出部分は繰り返さず。「## まとめ」で完結。" }
+        ]);
+        fullText += "\n" + result.text.replace(/^\n+/, "");
       }
+      if (result.truncated) setTruncWarn(true);
 
-      var result = await callEdgeFunction("generate-article", {
-        action: "generate",
-        sel, theme, kw, tone, aud, len, outline, seriesCtx, paid, pidx, userInst
-      });
-
-      setRaw(result.body);
-      setStep(2);
-      setEditMode(false);
+      var body = fullText.replace(/^```[\w]*\n?/, "").replace(/\n?```$/, "").trim();
+      var lines = body.split("\n"); var s2 = 0;
+      for (var i = 0; i < Math.min(lines.length, 5); i++) {
+        if (lines[i].trim().indexOf("## ") === 0) { s2 = i; break; }
+        if (lines[i].charAt(0) !== "#") { s2 = i; break; }
+      }
+      body = lines.slice(s2).join("\n").replace(/^\n+/, "");
+      if (forSr && body.indexOf("シリーズ") === -1) body += buildSeriesLinks();
+      if (refs.length > 0 && body.indexOf("参考文献") === -1) body += buildRefLinks();
+      setRaw(body); setStep(2); setEditMode(false);
     } catch (e) { setErr("記事生成失敗: " + e.message); }
     setLoading(false); setLoadMsg("");
   }
@@ -215,22 +323,32 @@ export default function App() {
   async function regenFromEdit() {
     setLoading(true); setErr(""); setLoadMsg("⏳ 編集を元に再生成中...");
     try {
-      var seriesCtx = "";
-      if (forSr) {
-        var prevArts = arts.filter(function(a){ return a.series_id === forSr; });
-        if (prevArts.length) {
-          seriesCtx = "\n【シリーズ】第" + (prevArts.length + 1) + "回";
-        }
+      var seriesCtx = buildSeriesContext();
+      var prompt = "以下はユーザーが編集した記事原稿です。この原稿を元に、文章を整え、自然で読みやすいnote.com記事として再生成してください。\n\nタイトル: " + sel + "\nテーマ: " + theme + "\nトーン: " + tone + "\n読者: " + (aud || "一般") + seriesCtx;
+      if (editNote.trim()) prompt += "\n\n【ユーザーからの指示・修正メモ】\n" + editNote;
+      prompt += "\n\n【ユーザー編集済み原稿】\n" + editText;
+      prompt += "\n\n【再生成ルール】\n1. ユーザーの追記・修正内容を最大限活かす\n2. 文章の流れを自然に整える\n3. 見出し構造（##, ###）を維持\n4. NanoBananaプロンプト部分はそのまま保持\n5. タイトルは本文に含めない\n6. 全体の一貫性を確保";
+
+      var result = await callApi(prompt, "note.com記事エディター。ユーザー編集を活かしつつ文章を改善。タイトル非含有。", TOKEN_MAP[len] || 8000);
+      var fullText = result.text;
+      var attempt = 0;
+      while (result.truncated && attempt < MAX_CONTINUES) {
+        attempt++;
+        setLoadMsg("⏳ 続き生成中...（" + attempt + "/" + MAX_CONTINUES + "）");
+        result = await callApi(null, "記事エディター。続きを書く。", CONT_TOKENS, [
+          { role: "user", content: prompt }, { role: "assistant", content: fullText },
+          { role: "user", content: "中断箇所から続きを。「## まとめ」で完結。" }
+        ]);
+        fullText += "\n" + result.text.replace(/^\n+/, "");
       }
-
-      var result = await callEdgeFunction("generate-article", {
-        action: "regen",
-        sel, theme, tone, aud, seriesCtx, editText, editNote, len
-      });
-
-      setRaw(result.body);
-      setEditMode(false);
-      setEditNote("");
+      var body = fullText.replace(/^```[\w]*\n?/, "").replace(/\n?```$/, "").trim();
+      var lines = body.split("\n"); var s2 = 0;
+      for (var i = 0; i < Math.min(lines.length, 5); i++) {
+        if (lines[i].trim().indexOf("## ") === 0) { s2 = i; break; }
+        if (lines[i].charAt(0) !== "#" && lines[i].trim()) { s2 = i; break; }
+      }
+      body = lines.slice(s2).join("\n").replace(/^\n+/, "");
+      setRaw(body); setEditMode(false); setEditNote("");
     } catch (e) { setErr("再生成失敗: " + e.message); }
     setLoading(false); setLoadMsg("");
   }
@@ -238,12 +356,13 @@ export default function App() {
   async function continueArt() {
     setLoading(true); setErr(""); setLoadMsg("⏳ 続き生成中...");
     try {
-      var result = await callEdgeFunction("generate-article", {
-        action: "continue",
-        sel, theme, tone, raw
-      });
-      setRaw(function (p) { return p + "\n\n" + result.body; });
-      setTruncWarn(false);
+      var result = await callApi(null, "note.comプロライター。続きを書く。", CONT_TOKENS, [
+        { role: "user", content: "以下の途中記事の続きを。\nタイトル: " + sel + "\nテーマ: " + theme + "\nトーン: " + tone + "\n\n記事:\n" + raw.slice(-2000) },
+        { role: "assistant", content: "承知しました。" },
+        { role: "user", content: "中断直後から続きのみ。「## まとめ」で完結。" }
+      ]);
+      setRaw(function (p) { return p + "\n\n" + result.text.replace(/^\n+/, "").replace(/^```[\w]*\n?/, "").replace(/\n?```$/, "").trim(); });
+      if (!result.truncated) setTruncWarn(false);
     } catch (e) { setErr("続き生成失敗: " + e.message); }
     setLoading(false); setLoadMsg("");
   }
@@ -255,14 +374,22 @@ export default function App() {
       var artData = { title: sel, theme: theme, kw: kw, tone: tone, aud: aud, len: len, raw: raw, tags: tags, paid: paid, price: price, pidx: pidx, outline: outline, eyecatch: eyecatch, seo: (outline && outline.seoDescription) || "", userInst: userInst, series_id: forSr || null };
 
       if (editId) {
+        // 既存記事を更新
         var { error: upErr } = await supabase.from("articles").update(artData).eq("id", editId);
         if (upErr) throw upErr;
-        setArts(function(p){ return p.map(function(a){ return a.id === editId ? Object.assign({}, a, artData) : a; }); });
+        setArts(function(p){ return p.map(function(a){ return a.id === editId ? Object.assign({}, a, artData, { id: editId }) : a; }); });
         setEditId(null);
       } else {
+        // 新規記事を作成
         var { data: newArt, error: insErr } = await supabase.from("articles").insert([artData]).select();
         if (insErr) throw insErr;
         if (newArt && newArt.length > 0) setArts(function(p){ return [newArt[0]].concat(p); });
+      }
+
+      // 参考文献を保存
+      if (refs.length > 0 && newArt && newArt[0]) {
+        var refData = refs.map(function(r){ return { article_id: newArt[0].id, title: r.title, url: r.url }; });
+        await supabase.from("references").insert(refData);
       }
 
       setDbStatus("saved");
@@ -304,6 +431,7 @@ export default function App() {
     })();
   }
 
+  // Import functions
   async function importFromUrl() {
     setImpLoading(true); setImpErr("");
     try {
@@ -328,14 +456,30 @@ export default function App() {
     setImpLoading(false);
   }
 
+  async function importSelected() {
+    setImpLoading(true); setImpErr("");
+    try {
+      for (var i = 0; i < impSelected.length; i++) {
+        var article = impList.find(function(a){ return a.key === impSelected[i]; });
+        if (!article) continue;
+        var data = await fetchNoteArticle(article.key);
+        var artData = { title: data.title, theme: data.title, kw: data.tags ? data.tags.join(", ") : "", tone: "カジュアル", aud: "", len: "中（2000〜3000字）", raw: data.markdown || data.html || "", tags: data.tags || [], paid: false, price: "500", pidx: 2, outline: null, eyecatch: "", seo: data.description || "", userInst: "" };
+        var { data: newArt, error: e } = await supabase.from("articles").insert([artData]).select();
+        if (e) throw e;
+      }
+      setImpSelected([]); setImpList([]); setImpView("select"); setImpUrl(""); setImpUser("");
+    } catch (e) { setImpErr("インポート失敗: " + e.message); }
+    setImpLoading(false);
+  }
+
   async function savePreviewed() {
     if (!supabase || !impPreview) return;
     setImpLoading(true); setImpErr("");
     try {
       var artData = { title: impPreview.title, theme: impPreview.title, kw: impPreview.tags ? impPreview.tags.join(", ") : "", tone: "カジュアル", aud: "", len: "中（2000〜3000字）", raw: impPreview.markdown || impPreview.html || "", tags: impPreview.tags || [], paid: false, price: "500", pidx: 2, outline: null, eyecatch: "", seo: impPreview.description || "", userInst: "" };
-      var { data: newArt, error: e } = await supabase.from("articles").insert([artData]).select();
+      var { error: e } = await supabase.from("articles").insert([artData]).select();
       if (e) throw e;
-      if (newArt) setArts(function(p){ return [newArt[0]].concat(p); });
+      setArts(function(p){ return [Object.assign({}, artData, { id: Math.random().toString() })].concat(p); });
       setImpPreview(null); setImpView("select"); setImpUrl("");
     } catch (e) { setImpErr("保存失敗: " + e.message); }
     setImpLoading(false);
@@ -361,16 +505,33 @@ export default function App() {
   function applyTagEdit() { setTags(tagInput.split(/[,、\s]+/).map(function(t){ return t.replace(/^#/, "").trim(); }).filter(Boolean)); setEditTags(false); }
 
   function renderBody(t) {
-    var ls = t.split("\n"); var el = []; var i = 0;
+    var ls = t.split("\n"); var pd = false; var el = []; var i = 0;
     while (i < ls.length) {
       var l = ls[i].trim();
-      if (l.indexOf("### ") === 0) el.push(<h4 key={i} style={{ fontSize: 14, fontWeight: 700, margin: "12px 0 4px", color: "#333", borderLeft: "3px solid #8DD6C9", paddingLeft: 8 }}>{l.slice(4)}</h4>);
-      else if (l.indexOf("## ") === 0) el.push(<h3 key={i} style={{ fontSize: 16, fontWeight: 700, margin: "18px 0 6px", color: "#222", borderLeft: "4px solid #41C9B4", paddingLeft: 8 }}>{l.slice(3)}</h3>);
+      if (l.indexOf("有料") !== -1 && (l.indexOf("💰") !== -1 || l.indexOf("★") !== -1)) { pd = true; el.push(<div key={i} style={{ background: "#fff3cd", border: "2px solid #f39c12", borderRadius: 8, padding: "10px 14px", margin: "12px 0", textAlign: "center", fontSize: 14, fontWeight: 700, color: "#e67e22" }}>🔒 有料部分</div>); i++; continue; }
+      if (l.charAt(0) === "※" && (l.indexOf("画像") !== -1 || l.indexOf("挿入") !== -1)) { el.push(<div key={i} style={{ background: "#fff3e0", border: "1px dashed #ff9800", borderRadius: 6, padding: "6px 10px", margin: "4px 0", fontSize: 11, color: "#e65100", textAlign: "center" }}>{l}</div>); i++; continue; }
+      if (l.indexOf("NanoBanana") !== -1 || l.indexOf("📷") !== -1) {
+        var b = [l]; var j = i + 1;
+        while (j < ls.length && ls[j].trim() && ls[j].trim().indexOf("##") !== 0 && ls[j].trim().charAt(0) !== "※") { b.push(ls[j].trim()); j++; }
+        var m = b.join("\n").match(/[「『](.+?)[」』]/s); var pt = m ? m[1] : b.slice(1).join(" ");
+        el.push(<div key={i} style={{ background: "#e8f5e9", border: "2px solid #66bb6a", borderRadius: 8, padding: "12px 14px", margin: "10px 0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: "#2e7d32" }}>🍌 画像</span>
+            <button onClick={function () { cc(pt, "nb" + i); }} style={{ padding: "2px 8px", borderRadius: 4, border: "1px solid #66bb6a", background: copied === ("nb" + i) ? "#66bb6a" : "white", color: copied === ("nb" + i) ? "white" : "#2e7d32", fontSize: 10, cursor: "pointer" }}>{copied === ("nb" + i) ? "✓" : "コピー"}</button>
+          </div>
+          <div style={{ background: "rgba(255,255,255,0.7)", borderRadius: 6, padding: "6px 8px", fontSize: 12, color: "#1b5e20", fontFamily: "monospace", wordBreak: "break-word" }}>{pt}</div>
+        </div>);
+        i = j; while (i < ls.length && (ls[i].trim() === "" || (ls[i].trim().charAt(0) === "※"))) i++; continue;
+      }
+      var z = pd ? { opacity: 0.85, borderLeft: "3px solid #f39c12", paddingLeft: 6 } : {};
+      if (l.indexOf("### ") === 0) el.push(<h4 key={i} style={Object.assign({ fontSize: 14, fontWeight: 700, margin: "12px 0 4px", color: "#333", borderLeft: "3px solid #8DD6C9", paddingLeft: 8 }, z)}>{l.slice(4)}</h4>);
+      else if (l.indexOf("## ") === 0) el.push(<h3 key={i} style={Object.assign({ fontSize: 16, fontWeight: 700, margin: "18px 0 6px", color: "#222", borderLeft: "4px solid #41C9B4", paddingLeft: 8 }, z)}>{l.slice(3)}</h3>);
       else if (l === "---") el.push(<hr key={i} style={{ border: "none", borderTop: "1px solid #e0e0e0", margin: "14px 0" }} />);
-      else if (l.indexOf("> ") === 0) el.push(<blockquote key={i} style={{ borderLeft: "3px solid #ccc", paddingLeft: 8, margin: "4px 0", color: "#666", fontStyle: "italic" }}>{l.slice(2)}</blockquote>);
-      else if (l.indexOf("- ") === 0) el.push(<div key={i} style={{ paddingLeft: 12, margin: "2px 0" }}>• {l.slice(2)}</div>);
+      else if (l.indexOf("> ") === 0) el.push(<blockquote key={i} style={Object.assign({ borderLeft: "3px solid #ccc", paddingLeft: 8, margin: "4px 0", color: "#666", fontStyle: "italic" }, z)}>{l.slice(2)}</blockquote>);
+      else if (l.indexOf("- ") === 0) el.push(<div key={i} style={Object.assign({ paddingLeft: 12, margin: "2px 0" }, z)}>• {l.slice(2)}</div>);
+      else if (/^\d+\.\s/.test(l)) el.push(<div key={i} style={Object.assign({ paddingLeft: 12, margin: "2px 0" }, z)}>{l}</div>);
       else if (!l) el.push(<br key={i} />);
-      else { var h = l.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>"); el.push(<p key={i} style={{ margin: "4px 0" }} dangerouslySetInnerHTML={{ __html: h }} />); }
+      else { var h = l.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>"); el.push(<p key={i} style={Object.assign({ margin: "4px 0" }, z)} dangerouslySetInnerHTML={{ __html: h }} />); }
       i++;
     }
     return el;
@@ -419,14 +580,32 @@ export default function App() {
             <button onClick={function(){ setImpView("select"); }} style={{ marginTop: 10, padding: "6px 14px", borderRadius: 7, border: "1px solid #ddd", background: "white", fontSize: 12, cursor: "pointer" }}>← 戻る</button>
           </div>}
 
+          {impView === "user" && <div style={stCard}>
+            <label style={stLabel}>noteユーザー名</label>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input value={impUser} onChange={function(e){ setImpUser(e.target.value); }} placeholder="example_user" style={Object.assign({}, stInput, { flex: 1 })} />
+              <button onClick={importFromUsername} disabled={impLoading || !impUser} style={{ padding: "6px 16px", borderRadius: 7, border: "none", background: impLoading ? "#ccc" : "#42a5f5", color: "white", fontSize: 12, cursor: impLoading ? "not-allowed" : "pointer" }}>{impLoading ? "取得中..." : "取得"}</button>
+            </div>
+            <button onClick={function(){ setImpView("select"); }} style={{ marginTop: 10, padding: "6px 14px", borderRadius: 7, border: "1px solid #ddd", background: "white", fontSize: 12, cursor: "pointer" }}>← 戻る</button>
+          </div>}
+
           {impView === "preview" && impPreview && <div style={stCard}>
             <h3 style={{ fontSize: 14, margin: "0 0 10px" }}>{impPreview.title}</h3>
             <p style={{ fontSize: 12, color: "#666", margin: "0 0 10px" }}>{impPreview.description}</p>
-            <div style={{ background: "#f5f5f5", borderRadius: 6, padding: 8, fontSize: 11, maxHeight: 200, overflowY: "auto", marginBottom: 10 }}>{impPreview.markdown ? impPreview.markdown.slice(0, 500) : "本文なし"}</div>
+            <div style={{ background: "#f5f5f5", borderRadius: 6, padding: 8, fontSize: 11, maxHeight: 200, overflowY: "auto", marginBottom: 10 }}>{impPreview.markdown ? impPreview.markdown.slice(0, 500) : impPreview.html ? impPreview.html.slice(0, 500) : "本文なし"}</div>
             <div style={{ display: "flex", gap: 6 }}>
               <button onClick={function(){ setImpPreview(null); setImpView("select"); }} style={{ flex: 1, padding: "6px 12px", borderRadius: 7, border: "1px solid #ddd", background: "white", fontSize: 12, cursor: "pointer" }}>キャンセル</button>
               <button onClick={savePreviewed} disabled={impLoading} style={{ flex: 1, padding: "6px 12px", borderRadius: 7, border: "none", background: impLoading ? "#ccc" : "#4caf50", color: "white", fontSize: 12, fontWeight: 600, cursor: impLoading ? "not-allowed" : "pointer" }}>{impLoading ? "保存中..." : "💾 DBに保存"}</button>
             </div>
+          </div>}
+
+          {impView === "select" && impList.length > 0 && <div style={stCard}>
+            <h3 style={{ fontSize: 14, margin: "0 0 10px" }}>記事を選択</h3>
+            {impList.map(function(a, i){ return <label key={i} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 0", borderBottom: i < impList.length - 1 ? "1px solid #f0f0f0" : "none", cursor: "pointer" }}>
+              <input type="checkbox" checked={impSelected.includes(a.key)} onChange={function(){ setImpSelected(function(p){ return p.includes(a.key) ? p.filter(function(x){ return x !== a.key; }) : [a.key].concat(p); }); }} style={{ accentColor: "#42a5f5" }} />
+              <span style={{ flex: 1, fontSize: 12 }}>{a.title}</span>
+            </label>; })}
+            <button onClick={importSelected} disabled={impLoading || impSelected.length === 0} style={{ marginTop: 10, width: "100%", padding: "6px 12px", borderRadius: 7, border: "none", background: impLoading ? "#ccc" : "#4caf50", color: "white", fontSize: 12, fontWeight: 600, cursor: impLoading ? "not-allowed" : "pointer" }}>{impLoading ? "インポート中..." : "✅ 選択をインポート"}</button>
           </div>}
         </div>}
 
@@ -445,6 +624,7 @@ export default function App() {
                   <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 2 }}>
                     <span style={{ fontSize: 9, color: "#999" }}>{new Date(a.created_at).toLocaleDateString("ja-JP")}</span>
                     {sr && <span style={{ fontSize: 9, background: "#ede7f6", color: "#7c4dff", padding: "1px 6px", borderRadius: 8 }}>📖 {sr.name}</span>}
+                    <span style={{ fontSize: 9, color: "#666", background: "#f0f0f0", padding: "1px 4px", borderRadius: 3 }}>ID: {a.id.slice(0, 8)}</span>
                   </div>
                 </div>
                 <button onClick={function (e) { e.stopPropagation(); delArt(a.id); }} style={{ padding: "3px 6px", borderRadius: 3, border: "1px solid #ddd", background: "white", color: "#999", fontSize: 10, cursor: "pointer" }}>削除</button>
@@ -463,6 +643,10 @@ export default function App() {
             <div style={{ display: "flex", justifyContent: "space-between" }}><h2 style={{ fontSize: 15, margin: 0 }}>{viewArt.title}</h2><button onClick={function () { cc(viewArt.title, "dt"); }} style={btnCopy(copied === "dt")}>{copied === "dt" ? "✓" : "コピー"}</button></div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>{(viewArt.tags || []).map(function (h, i) { return <span key={i} style={stTag}>#{h}</span>; })}</div>
           </div>
+          {viewArt.eyecatch && <div style={Object.assign({}, stCard, { border: "2px solid #ff9800", background: "#fff8e1" })}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 13, fontWeight: 700, color: "#e65100" }}>🖼️ アイキャッチ</span><button onClick={function () { cc(viewArt.eyecatch, "dec"); }} style={btnCopy(copied === "dec")}>{copied === "dec" ? "✓" : "コピー"}</button></div>
+            <div style={{ background: "white", borderRadius: 6, padding: 8, fontSize: 12, color: "#bf360c", fontFamily: "monospace", wordBreak: "break-word" }}>{viewArt.eyecatch}</div>
+          </div>}
           <div style={stCard}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}><span style={{ fontSize: 14, fontWeight: 700 }}>記事本文</span><button onClick={function () { cc(viewArt.raw, "da"); }} style={{ padding: "5px 14px", borderRadius: 7, border: "none", background: "linear-gradient(135deg,#41C9B4,#2BA89D)", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{copied === "da" ? "✓コピー済" : "📋全文コピー"}</button></div>
             <div style={{ background: "#fafafa", borderRadius: 7, padding: 14, fontSize: 13, lineHeight: 1.7, maxHeight: 400, overflowY: "auto", border: "1px solid #eee" }}>{renderBody(viewArt.raw)}</div>
@@ -528,6 +712,15 @@ export default function App() {
                 <div style={{ flex: 1 }}><label style={stLabel}>文字数</label><select value={len} onChange={function (e) { setLen(e.target.value); }} style={stSel}>{LENS.map(function (v) { return <option key={v} value={v}>{v}</option>; })}</select></div>
               </div>
             </div>
+            <div style={Object.assign({}, stCard, { border: "2px solid #42a5f5" })}>
+              <h3 style={{ fontSize: 14, margin: "0 0 8px", color: "#1565c0" }}>📚 参考文献</h3>
+              <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                <input value={newRef.title} onChange={function (e) { setNewRef(function (p) { return Object.assign({}, p, { title: e.target.value }); }); }} placeholder="タイトル" style={Object.assign({}, stInput, { flex: 1 })} />
+                <input value={newRef.url} onChange={function (e) { setNewRef(function (p) { return Object.assign({}, p, { url: e.target.value }); }); }} placeholder="URL" style={Object.assign({}, stInput, { flex: 1.5 })} onKeyDown={function (e) { if (e.key === "Enter") addRef(); }} />
+                <button onClick={addRef} disabled={!canRef} style={{ padding: "6px 12px", borderRadius: 7, border: "none", background: canRef ? "#42a5f5" : "#ccc", color: "white", fontSize: 12, cursor: canRef ? "pointer" : "not-allowed" }}>追加</button>
+              </div>
+              {refs.length > 0 && <div>{refs.map(function (r, idx) { return <div key={idx} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0" }}><span style={{ fontSize: 11, fontWeight: 700 }}>{idx + 1}.</span><span style={{ flex: 1, fontSize: 12 }}>{r.title}</span><button onClick={function () { var ci = idx; setRefs(function(p){ return p.filter(function(_,j){ return j !== ci; }); }); }} style={{ padding: "1px 4px", border: "1px solid #ddd", borderRadius: 3, background: "white", color: "#e53935", fontSize: 10, cursor: "pointer" }}>×</button></div>; })}</div>}
+            </div>
             <div style={Object.assign({}, stCard, { border: "2px solid #66bb6a" })}>
               <h3 style={{ fontSize: 14, margin: "0 0 10px", color: "#2e7d32" }}>🍌 画像設定</h3>
               <div style={{ display: "flex", gap: 10 }}>
@@ -535,9 +728,16 @@ export default function App() {
                 <div style={{ flex: 1 }}><label style={stLabel}>比率</label><select value={iAsp} onChange={function (e) { setIA(e.target.value); }} style={stSel}><option value="16:9">16:9</option><option value="1:1">1:1</option><option value="9:16">9:16</option></select></div>
               </div>
             </div>
+            <div style={Object.assign({}, stCard, paid ? { border: "2px solid #f39c12" } : {})}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <h3 style={{ fontSize: 14, margin: 0 }}>💰 有料記事</h3>
+                <div onClick={function () { setPaid(!paid); }} style={{ width: 44, height: 24, borderRadius: 12, background: paid ? "#f39c12" : "#ccc", cursor: "pointer", padding: 2, position: "relative" }}><div style={{ width: 20, height: 20, borderRadius: 10, background: "white", position: "absolute", top: 2, left: paid ? 22 : 2, transition: "all 0.3s" }} /></div>
+              </div>
+            </div>
             <div style={Object.assign({}, stCard, { border: userInst.trim() ? "2px solid #ab47bc" : "1px solid #e0e0e0" })}>
               <h3 style={{ fontSize: 14, margin: "0 0 8px", color: "#7b1fa2" }}>💬 記事への指示・リクエスト</h3>
-              <textarea value={userInst} onChange={function(e){ setUserInst(e.target.value); }} placeholder="AIへの自由な指示を書いてください" style={{ width: "100%", minHeight: 80, padding: "10px 12px", borderRadius: 7, border: "1px solid #ce93d8", fontSize: 13, lineHeight: 1.6, boxSizing: "border-box", outline: "none", resize: "vertical", background: "#faf5ff", fontFamily: "inherit" }} />
+              <p style={{ fontSize: 11, color: "#888", margin: "0 0 8px" }}>AIへの自由な指示を書いてください。構成と記事生成の両方に反映されます。</p>
+              <textarea value={userInst} onChange={function(e){ setUserInst(e.target.value); }} placeholder={"例:\n・AとBの違いについても触れてほしい\n・実体験ベースで書いてほしい\n・初心者にもわかりやすく、専門用語には解説をつけて"} style={{ width: "100%", minHeight: 100, padding: "10px 12px", borderRadius: 7, border: "1px solid #ce93d8", fontSize: 13, lineHeight: 1.6, boxSizing: "border-box", outline: "none", resize: "vertical", background: "#faf5ff", fontFamily: "inherit" }} />
             </div>
             <button onClick={genOL} disabled={!theme || loading} style={btnPrimary(!!theme && !loading)}>{loading ? (loadMsg || "⏳ 構成生成中...") : "構成を生成する →"}</button>
           </div>}
@@ -547,6 +747,31 @@ export default function App() {
             <div style={stCard}>
               <h2 style={{ fontSize: 15, margin: "0 0 10px" }}>タイトル選択</h2>
               {titles.map(function (t, i) { return <label key={i} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 10px", borderRadius: 7, marginBottom: 5, border: sel === t ? "2px solid #41C9B4" : "1px solid #eee", background: sel === t ? "#f0faf8" : "white", cursor: "pointer", fontSize: 13 }}><input type="radio" name="t" checked={sel === t} onChange={function () { setSel(t); }} style={{ accentColor: "#41C9B4" }} />{t}</label>; })}
+              <input value={sel} onChange={function (e) { setSel(e.target.value); }} placeholder="カスタムタイトル" style={Object.assign({}, stInput, { marginTop: 4, fontSize: 12 })} />
+            </div>
+            {eyecatch && <div style={Object.assign({}, stCard, { border: "2px solid #ff9800", background: "#fff8e1" })}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 13, fontWeight: 700, color: "#e65100" }}>🖼️ アイキャッチ</span><button onClick={function () { cc(eyecatch, "ec"); }} style={btnCopy(copied === "ec")}>{copied === "ec" ? "✓" : "コピー"}</button></div>
+              <div style={{ background: "white", borderRadius: 6, padding: 8, fontSize: 12, color: "#bf360c", fontFamily: "monospace", wordBreak: "break-word" }}>{eyecatch}</div>
+            </div>}
+            {paid && <div style={Object.assign({}, stCard, { border: "2px solid #f39c12", background: "#fff8e1" })}>
+              <h3 style={{ fontSize: 14, margin: "0 0 10px", color: "#e65100" }}>💰 有料設定</h3>
+              <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
+                <div style={{ flex: 1 }}><label style={stLabel}>価格（円）</label><input type="number" value={price} onChange={function (e) { setPrice(e.target.value); }} style={stInput} step="100" min="100" /></div>
+                <div style={{ flex: 1 }}><label style={stLabel}>無料セクション数</label><input type="number" value={pidx} onChange={function (e) { setPidx(Math.max(1, parseInt(e.target.value) || 1)); }} style={stInput} min="1" /></div>
+              </div>
+            </div>}
+            <div style={stCard}>
+              <h2 style={{ fontSize: 15, margin: "0 0 10px" }}>見出し構成</h2>
+              {outline.sections.map(function (sec, i) {
+                return <div key={i} style={{ padding: "8px 0", borderBottom: i < outline.sections.length - 1 ? "1px solid #f0f0f0" : "none" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <span style={{ background: "#41C9B4", color: "white", borderRadius: 4, padding: "1px 6px", fontSize: 9, fontWeight: 700 }}>H2</span>
+                    <span style={{ fontSize: 13, fontWeight: 600 }}>{sec.heading}</span>
+                    {sec.hasImage && <span style={{ fontSize: 10 }}>🍌</span>}
+                  </div>
+                  <p style={{ margin: "2px 0 0 30px", fontSize: 11, color: "#777" }}>{sec.summary}</p>
+                </div>;
+              })}
             </div>
             <div style={stCard}>
               <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ fontSize: 13, fontWeight: 600 }}>ハッシュタグ</span><button onClick={function () { cc(tags.map(function (h) { return "#" + h; }).join(" "), "tg"); }} style={btnCopy(copied === "tg")}>{copied === "tg" ? "✓" : "コピー"}</button></div>
@@ -572,6 +797,23 @@ export default function App() {
             </div>}
 
             <div style={{ background: "#fff8e1", border: "2px solid #ff9800", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#f57f17" }}>⚠️ AI生成テンプレート — 画像{countImg(raw)}箇所はプロンプトのみ。</div>
+
+            {eyecatch && <div style={Object.assign({}, stCard, { border: "2px solid #ff9800", background: "#fff8e1" })}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 13, fontWeight: 700, color: "#e65100" }}>🖼️ アイキャッチ</span><button onClick={function () { cc(eyecatch, "ec2"); }} style={btnCopy(copied === "ec2")}>{copied === "ec2" ? "✓" : "コピー"}</button></div>
+              <div style={{ background: "white", borderRadius: 6, padding: 8, fontSize: 11, color: "#bf360c", fontFamily: "monospace", wordBreak: "break-word" }}>{eyecatch}</div>
+            </div>}
+
+            {nbList.length > 0 && <div style={Object.assign({}, stCard, { border: "2px solid #66bb6a" })}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 13, fontWeight: 700, color: "#2e7d32" }}>🍌 NanoBanana ({nbList.length}枚)</span><button onClick={function () { cc(nbList.join("\n\n---\n\n"), "anb"); }} style={btnCopy(copied === "anb")}>{copied === "anb" ? "✓" : "全コピー"}</button></div>
+              {nbList.map(function (p, i) {
+                var k = "nl" + i;
+                return <div key={i} style={{ display: "flex", gap: 4, marginBottom: 4, background: "#f1f8e9", borderRadius: 5, padding: "6px 8px" }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: "#2e7d32" }}>#{i + 1}</span>
+                  <div style={{ flex: 1, fontSize: 11, color: "#1b5e20", wordBreak: "break-word" }}>{p}</div>
+                  <button onClick={function () { cc(p, k); }} style={{ padding: "1px 5px", borderRadius: 3, border: "1px solid #a5d6a7", background: copied === k ? "#66bb6a" : "white", color: copied === k ? "white" : "#2e7d32", fontSize: 9, cursor: "pointer" }}>{copied === k ? "✓" : "コピー"}</button>
+                </div>;
+              })}
+            </div>}
 
             <div style={stCard}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
@@ -621,10 +863,24 @@ export default function App() {
               )}
             </div>
 
+            {outline && outline.seoDescription && <div style={stCard}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 13, fontWeight: 600 }}>🔍 SEO説明文</span><button onClick={function () { cc(outline.seoDescription, "seo2"); }} style={btnCopy(copied === "seo2")}>{copied === "seo2" ? "✓" : "コピー"}</button></div>
+              <p style={{ fontSize: 12, color: "#555", margin: 0, background: "#f5f5f5", borderRadius: 6, padding: "8px 10px" }}>{outline.seoDescription}</p>
+            </div>}
+
             <div style={{ display: "flex", gap: 8 }}>
               <button onClick={function () { setStep(1); }} style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid #ddd", background: "white", fontSize: 13, cursor: "pointer" }}>← 構成</button>
               <button onClick={saveArt} disabled={loading || dbStatus === "saving"} style={{ flex: 1, padding: 10, borderRadius: 8, border: "none", background: dbStatus === "saving" ? "#ff9800" : "#7c4dff", color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>💾 保存</button>
               <button onClick={reset} style={{ flex: 1, padding: 10, borderRadius: 8, border: "none", background: "linear-gradient(135deg,#41C9B4,#2BA89D)", color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>🆕 新規</button>
+            </div>
+
+            <div style={{ background: "#f0faf8", borderRadius: 8, padding: 14, border: "1px solid #d4ede8", fontSize: 12, color: "#555", lineHeight: 1.7 }}>
+              <p style={{ fontWeight: 700, color: "#2BA89D", margin: "0 0 6px" }}>📌 投稿手順</p>
+              <p style={{ margin: "2px 0" }}>1. アイキャッチ → NanoBananaでサムネ生成</p>
+              <p style={{ margin: "2px 0" }}>2. 本文内プロンプト → 画像生成({countImg(raw)}枚)</p>
+              <p style={{ margin: "2px 0" }}>3. 全文コピー → note.comで投稿 → プロンプト箇所を画像に差替え</p>
+              <p style={{ margin: "2px 0" }}>4. ハッシュタグ・SEO説明文設定</p>
+              {paid && <p style={{ margin: "6px 0 0", color: "#e67e22", fontWeight: 600 }}>💰 有料: 公開設定 → 有料 → {price}円</p>}
             </div>
           </div>}
         </>}

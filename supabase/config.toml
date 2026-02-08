@@ -1,0 +1,28 @@
+# Suabase Configuration
+
+[project]
+account_id = "ujymuexfxhuvrpkprkch"
+db_version = "15"
+
+[api]
+enabled = true
+max_body_size = 20
+
+[auth]
+enable_signup = true
+enable_anonymous_signups = false
+
+[functions]
+verify_jwt = false
+
+[[functions.note-import]]
+enabled = true
+
+[[functions.generate-outline]]
+enabled = true
+
+[[functions.generate-article]]
+enabled = true
+
+[[functions.article-helpers]]
+enabled = true
